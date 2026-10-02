@@ -1,4 +1,4 @@
-K.S.: Substantial modifications (topN rotamer and Chi2 limitation) were introduced and are under verification.
+K.S.: Substantial modifications (topN rotamer and Chi2 limitation) were introduced and are under validation.
 
 # INTRODUCTION
 
