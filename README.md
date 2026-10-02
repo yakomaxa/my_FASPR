@@ -1,4 +1,4 @@
-K.S.: Substantial modifications (topN rotamer and Chi2 limitation) were introduced and are under validation.
+K.S.: Substantial modifications (topN rotamer and Chi2 limitation) were introduced and are under validation. The bugs in modified version here should be attributed to K.S, and please post issue here. 
 
 # INTRODUCTION
 
@@ -55,7 +55,8 @@ Same, also restricting TRP, combined with a global top-5 rotamer limit:
 We recommend users to download the FASPR source-code package to your computer and build the FASPR executable on your own. After downloading and unzipping the package, change into the $path/FASPR/ directory and run "<b>g++ -O3 --fast-math -o FASPR src/*.cpp</b>" if you are working on UNIX or Linux. For Mac users, use "-fast-math" or ignore it. If you are working on the Windows system, you need to install the g++ compiler first.
 
 # COPYRIGHT & CONTACT
-Copyright (c) Xiaoqiang Huang. FASPR is free to academic users. For suggestions, please contact xiaoqiah@umich.edu or xiaoqiah@outlook.com.
+Copyright (c) Xiaoqiang Huang. FASPR is free to academic users. For suggestions, please contact xiaoqiah@umich.edu or xiaoqiah@outlook.com. 
+* K.S.: The bugs in modified version here should be attributed to K.S, and please post issue here. 
 
 # REFERENCES
 1. Huang x, Pearce R, Zhang Y, FASPR: an open-source tool for fast and accurate protein side-chain packing. Bioinformatics (2020) 36: 3758-3765.
