@@ -21,6 +21,51 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 extern string PROGRAM_PATH;
 extern string ROTLIB2010;
+extern int ROTAMER_TOPN;
+extern vector<SiteOverride> SITE_OVERRIDES;
+extern bool AROMACHI2_ENABLED;
+extern float AROMACHI2_MIN;
+extern float AROMACHI2_MAX;
+extern bool AROMACHI2_INCLUDE_TRP;
+
+void RotamerBuilder::BuildSiteTopNMap()
+{
+  siteTopNMap.clear();
+  if(SITE_OVERRIDES.empty())return;
+  vector<bool> matched(SITE_OVERRIDES.size(),false);
+  char keybuf[32];
+  size_t oi;
+  int i;
+  for(oi=0;oi<SITE_OVERRIDES.size();oi++){
+    const SiteOverride&ov=SITE_OVERRIDES[oi];
+    for(i=0;i<nres;i++){
+      if(pdb[i].chID==ov.chID && pdb[i].pos==ov.pos && pdb[i].ins==ov.ins){
+        sprintf(keybuf,"%c|%d|%c",ov.chID,ov.pos,ov.ins);
+        if(siteTopNMap.count(keybuf)){
+          cout<<"warning! duplicate -n/-m site override for chain '"<<ov.chID
+              <<"' residue "<<ov.pos<<ov.ins<<", using the later value ("<<ov.topn<<")"<<endl;
+        }
+        siteTopNMap[keybuf]=ov.topn;
+        matched[oi]=true;
+        if(subStat[i]==0){
+          cout<<"warning! -n/-m site override for chain '"<<ov.chID<<"' residue "<<ov.pos<<ov.ins
+              <<" has no effect: this residue is fixed via -s and will not be repacked"<<endl;
+        }
+        else if(seq[i]=='A'||seq[i]=='G'){
+          cout<<"warning! -n/-m site override for chain '"<<ov.chID<<"' residue "<<ov.pos<<ov.ins
+              <<" has no effect: "<<(seq[i]=='A'?"ALA":"GLY")<<" has no side-chain rotamers to restrict"<<endl;
+        }
+      }
+    }
+  }
+  for(oi=0;oi<SITE_OVERRIDES.size();oi++){
+    if(!matched[oi]){
+      cout<<"warning! -n/-m site override for chain '"<<SITE_OVERRIDES[oi].chID
+          <<"' residue "<<SITE_OVERRIDES[oi].pos<<SITE_OVERRIDES[oi].ins
+          <<" did not match any residue in the input structure; ignoring"<<endl;
+    }
+  }
+}
 
 #define WGT_CYS  5.5
 #define WGT_ASP  2.0
@@ -144,6 +189,9 @@ void RotamerBuilder::LoadBBdepRotlib2010()
     cerr<<"error! cannot open rotamer library "<<rotfile<<endl;
     exit(0);
   }
+  BuildSiteTopNMap();
+  char sitekey[32];
+  int effTopN;
   for(i=0;i<nres;i++){
     mp=0.;
     if(subStat[i]==0||seq[i]=='A'||seq[i]=='G'){
@@ -182,6 +230,42 @@ void RotamerBuilder::LoadBBdepRotlib2010()
       ftmp.clear();
       ap+=p;
       if(ap>ROT_PROB_CUT_ACC)break;
+    }
+    if(AROMACHI2_ENABLED && (seq[i]=='F'||seq[i]=='Y'||seq[i]=='H'||(AROMACHI2_INCLUDE_TRP&&seq[i]=='W'))){
+      FV1 stmpA;
+      FV2 ctmpA;
+      float chi2;
+      for(k=0;k<(int)ctmp.size();k++){
+        chi2=ctmp[k][1];//chi2 is the 2nd chi angle for F/Y/H/W (Chin==2)
+        if(chi2<0.)chi2+=180.;
+        if(chi2>=AROMACHI2_MIN && chi2<=AROMACHI2_MAX){
+          stmpA.push_back(stmp[k]);
+          ctmpA.push_back(ctmp[k]);
+        }
+      }
+      if(!stmpA.empty()){//never leave a residue with zero candidate rotamers
+        stmp=stmpA;
+        ctmp=ctmpA;
+      }
+    }
+    effTopN=ROTAMER_TOPN;
+    if(!siteTopNMap.empty()){
+      sprintf(sitekey,"%c|%d|%c",pdb[i].chID,pdb[i].pos,pdb[i].ins);
+      map<string,int>::iterator mit=siteTopNMap.find(sitekey);
+      if(mit!=siteTopNMap.end())effTopN=mit->second;
+    }
+    if(effTopN>0 && (int)stmp.size()>effTopN){
+      IV1 order(stmp.size());
+      for(k=0;k<(int)order.size();k++)order[k]=k;
+      sort(order.begin(),order.end(),[&stmp](int a,int b){return stmp[a]>stmp[b];});
+      FV1 stmp2;
+      FV2 ctmp2;
+      for(k=0;k<effTopN;k++){
+        stmp2.push_back(stmp[order[k]]);
+        ctmp2.push_back(ctmp[order[k]]);
+      }
+      stmp=stmp2;
+      ctmp=ctmp2;
     }
 CT:    chi.push_back(ctmp);
     ctmp.clear();

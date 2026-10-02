@@ -1,0 +1,408 @@
+FASPR: Optional top-N rotamer restriction (-n N),
+including per-site overrides (-n CHAIN:POS:N / -m sitemap.txt)
+================================================================
+
+1. FILES/FUNCTIONS THAT CONTROL ROTAMER LOADING & CANDIDATE GENERATION
+-----------------------------------------------------------------------
+- src/RotamerBuilder.cpp / RotamerBuilder::LoadBBdepRotlib2010()
+  Opens dun2010bbdep.bin, seeks to the (phi,psi)-bin offset for each
+  residue's amino acid type, and reads rotamer candidates sequentially
+  into per-residue vectors:
+    - probability  -> local `stmp` (FV1)      -> class member `probRot[i]`
+    - chi angles   -> local `ctmp` (FV2)      -> class member `chi[i]`
+    - count        -> `nrots[i]`
+    - running max  -> `maxProb[i]`
+  The read loop already stops early on ROT_PROB_CUT_MIN / ROT_PROB_CUT_ACC,
+  but does not guarantee the file's internal ordering is sorted, so
+  filtering was implemented with an explicit sort rather than relying on
+  read order.
+
+- src/RotamerBuilder.cpp / RotamerBuilder::BuildSidechain()
+  Calls LoadBBdepRotlib2010(), then AssignSidechainTopology(), then
+  loops j = 0..nrots[i] calling SideChain() to build Cartesian
+  coordinates for every candidate rotamer into `sc[i]`. `sc` then feeds
+  CalcSelfEnergy() / CalcPairEnergy() / Search() in FASPR.cpp (the
+  packing/optimization stage).
+
+INSERTION POINT
+----------------
+Right after the per-residue rotamer list (stmp/ctmp) is fully read in
+LoadBBdepRotlib2010(), just before it is pushed into chi/probRot/nrots
+(before the `CT:` label). This is the earliest point where final
+probabilities are known and precedes all expensive work: Cartesian
+side-chain building, self-energy, pair-energy, and search.
+
+2. CHANGES MADE
+-----------------
+- src/FASPR.cpp
+  - Added global `int ROTAMER_TOPN=-1;` (sentinel: -1 = no restriction,
+    i.e. default FASPR behavior).
+  - Added `#include <cctype>` and `#include <cstdlib>`.
+  - Added a `-n` branch in the CLI argument loop that:
+      * requires the argument to consist only of digit characters
+        (rejects negatives, decimals, empty string, non-numeric input),
+      * requires the parsed value to be > 0,
+      * on failure prints a clear error message to stderr and returns
+        exit code 1,
+      * on success sets ROTAMER_TOPN to the parsed value.
+  - Updated the usage/help text to mention `-n N`.
+
+- src/RotamerBuilder.cpp
+  - Added `extern int ROTAMER_TOPN;`
+  - In LoadBBdepRotlib2010(), immediately after the per-residue read
+    loop, added:
+
+      if(ROTAMER_TOPN>0 && (int)stmp.size()>ROTAMER_TOPN){
+        IV1 order(stmp.size());
+        for(k=0;k<(int)order.size();k++)order[k]=k;
+        sort(order.begin(),order.end(),[&stmp](int a,int b){return stmp[a]>stmp[b];});
+        FV1 stmp2; FV2 ctmp2;
+        for(k=0;k<ROTAMER_TOPN;k++){
+          stmp2.push_back(stmp[order[k]]);
+          ctmp2.push_back(ctmp[order[k]]);
+        }
+        stmp=stmp2; ctmp=ctmp2;
+      }
+
+    This ranks candidates by Dunbrack probability descending and keeps
+    only the top N (or all of them if fewer than N are available).
+
+  NOTE - THIS IS BACKBONE-DEPENDENT, NOT A GLOBAL/BBIND CULL:
+    The above block sits inside LoadBBdepRotlib2010()'s per-residue
+    loop, AFTER that residue's own phi[i]/psi[i] have already been used
+    to compute phin/psin and seek to that specific (phi,psi) bin in
+    dun2010bbdep.bin. stmp/ctmp at the point of filtering therefore
+    already contain only the candidates for residue i's own backbone
+    dihedral bin. The top-N cull is applied per residue to that
+    residue-specific, bin-specific list -- it does not pool or compare
+    candidates across residues or across (phi,psi) bins. Two residues
+    of the same amino acid type with different backbone conformations
+    get different candidate pools before filtering, and each pool is
+    independently ranked and truncated to N.
+
+- README.md
+  - Documented the new `-n N` option (positive integer, ranks by
+    Dunbrack probability, keeps all if residue has fewer than N
+    rotamers, omitting -n preserves default behavior).
+  - Added example command:
+      ./FASPR -i input.pdb -o output.pdb -n 5
+
+3. FILTERING LOGIC (RANKING RULE)
+-----------------------------------
+Rotamers are ranked by their Dunbrack probability (the same float value
+already used by the existing code for maxProb/self-energy weighting),
+descending, and only the first N survive per residue. If a residue's
+candidate count is <= N, nothing is removed.
+
+4. BUILD / TEST RESULTS
+-------------------------
+Build command (per repo's build.sh):
+  g++ -w -O3 --fast-math -o FASPR src/*.cpp
+-> builds cleanly, no warnings or errors.
+
+Validation performed against example/1mol.pdb:
+- No -n specified:
+    Output verified BYTE-IDENTICAL to a separately reconstructed
+    "pristine" (unmodified) build's output. Confirms -n omission
+    exactly preserves original behavior (requirement 5).
+- -n 1, -n 3, -n 10:
+    All ran successfully, produced distinct valid PDB outputs, and
+    completed with progressively shorter runtimes as N decreased
+    (0.030s baseline -> 0.0029s at N=1), confirming the pruning
+    happens before the expensive DEE/tree-decomposition search stage.
+- -n 100000 (exceeds every residue's available rotamer count):
+    Output identical to the unrestricted default run, confirming the
+    "keep all if fewer than N available" rule (requirement 4).
+- Invalid values -n 0, -n -5, -n 3.5, -n abc:
+    All rejected with a clear stderr error message and exit code 1
+    (requirement 6).
+
+Note: the repository's pre-existing example/1mol_FASPR.pdb sample file
+differs slightly from a freshly built default run (CRLF line endings,
+atom serial numbering restart per residue, and a handful of coordinate
+differences on long flexible side chains). This was traced to that
+sample having been generated by a different FASPR build/version, and is
+unrelated to this patch -- confirmed by directly diffing the patched
+build's default output against a from-scratch pristine (unmodified
+source) build, which were byte-identical.
+
+5. ASSUMPTION ABOUT THE STORED ROTAMER PROBABILITY
+-----------------------------------------------------
+The first 4-byte float read per rotamer record in dun2010bbdep.bin is
+assumed to be the Dunbrack backbone-dependent rotamer probability for
+that (phi,psi) bin -- this matches how the existing (unmodified) code
+already interprets and uses this value (e.g. for maxProb and
+self-energy weighting), so ranking directly on it required no
+transformation.
+
+6. FOLLOW-UP: PER-SITE (RESIDUE-SPECIFIC) TOP-N OVERRIDES
+=============================================================
+Added on request, as an extension of the above: the ability to set a
+DIFFERENT rotamer-count limit for specific residues, instead of (or in
+addition to) one global N for the whole structure. Two mutually
+exclusive input mechanisms are provided, both producing identical
+results for the same overrides (verified below).
+
+6.1 WHY THIS WAS STRAIGHTFORWARD
+-----------------------------------
+The existing filtering block already lives inside LoadBBdepRotlib2010()'s
+per-residue loop (see section 1/3 above), at a point where `pdb[i].chID`,
+`pdb[i].pos`, and `pdb[i].ins` (chain id, residue number, insertion code --
+Structure.h's Residue struct) are already in scope. No architectural
+change was needed: a per-residue effective N just replaces the single
+global N at the same insertion point.
+
+6.2 NEW CLI SURFACE
+-----------------------------------
+- `-n N` (unchanged): still sets the global default N for every residue.
+- `-n CHAIN:POS[ICODE]:N` (repeatable): inline per-site override, e.g.
+  `-n A:15:3` limits chain A residue 15 to its 3 best rotamers. `CHAIN`
+  is a single character, or `_` for a blank/space chain id. `POS[ICODE]`
+  is a residue number with an optional single trailing insertion-code
+  letter (e.g. `15` or `15A`). Can be repeated for multiple sites and
+  combined with one plain `-n N` for the default.
+- `-m sitemap.txt`: alternative bulk mechanism -- a text file with one
+  override per line, `CHAIN POS[ICODE] N`, `#` comments and blank lines
+  ignored. Also combinable with a plain `-n N` default.
+- Mutual exclusivity: inline `-n CHAIN:POS:N` overrides and `-m` cannot
+  both be used in the same run -- the program errors out
+  ("cannot combine inline -n CHAIN:POS:N site overrides with a -m
+  site-map file; choose one mechanism") with exit code 1 if both are
+  present. A plain `-n N` default does not count as a "site override"
+  for this check, so it may accompany either mechanism.
+
+6.3 FILES/FUNCTIONS CHANGED
+-----------------------------------
+- src/RotamerBuilder.h
+  - Added `struct SiteOverride { char chID; int pos; char ins; int topn; };`
+  - Added `void BuildSiteTopNMap();` method declaration.
+  - Added `map<string,int> siteTopNMap;` member (key: "chID|pos|ins").
+
+- src/RotamerBuilder.cpp
+  - Added `extern vector<SiteOverride> SITE_OVERRIDES;`
+  - Added `RotamerBuilder::BuildSiteTopNMap()`: for each entry in
+    SITE_OVERRIDES, linearly scans `pdb[]` for a matching
+    (chID,pos,ins) and records it in `siteTopNMap`; warns (does not
+    fail) on duplicate overrides for the same site (later wins) and on
+    overrides that match no residue in the structure.
+  - `LoadBBdepRotlib2010()` now calls `BuildSiteTopNMap()` once up
+    front, and inside the per-residue loop computes
+    `effTopN = ROTAMER_TOPN`, then overrides it from `siteTopNMap` by
+    key `"chID|pos|ins"` if a match exists for residue i. The existing
+    filtering block's `ROTAMER_TOPN` was replaced with `effTopN`
+    throughout; when `siteTopNMap` is empty (no `-n`/`-m` site syntax
+    used) this is a no-op and behaves exactly as before.
+
+- src/FASPR.cpp
+  - Added `vector<SiteOverride> SITE_OVERRIDES;` (global, default empty).
+  - Added small parsing helpers: `ParsePositiveInt`, `ParseChainToken`,
+    `ParsePosIcodeToken`, `ParseSiteTriple`, `SplitOnChar`.
+  - `-n`'s argument is now inspected for a `:` to decide whether it's a
+    plain global integer (existing path, unchanged validation) or a
+    `CHAIN:POS:N` site override (parsed and validated field-by-field,
+    appended to `SITE_OVERRIDES`).
+  - Added a new `-m FILE` branch that reads the site-map file line by
+    line (stripping `#` comments and blank lines) and parses each
+    remaining line the same way (whitespace-separated `CHAIN POS N`),
+    appending to `SITE_OVERRIDES`.
+  - After the argument loop, added the mutual-exclusivity check between
+    inline site overrides and `-m`.
+  - Updated usage/help text for both new forms.
+
+- README.md
+  - Documented `-n CHAIN:POS[ICODE]:N` and `-m sitemap.txt`, their
+    combination with a default `-n N`, the mutual-exclusivity rule, and
+    added example commands for both mechanisms.
+
+6.4 VALIDATION / RANKING SEMANTICS (UNCHANGED PRINCIPLE, NARROWER SCOPE)
+----------------------------------------------------------------------------
+Exactly as in section 3/the backbone-dependence note above: the per-site
+override only narrows WHICH per-residue N is used at the existing,
+already-backbone-dependent (phi,psi)-bin-specific filtering point. It
+does not change the ranking rule (still descending Dunbrack probability)
+or move the insertion point. All N values -- global, inline-site, and
+site-map-file -- go through the same strict positive-integer validation
+as the original `-n N` (reject 0, negative, non-integer; clear stderr
+message; exit code 1).
+
+6.5 BUILD / TEST RESULTS FOR THE SITE-SPECIFIC EXTENSION
+----------------------------------------------------------
+Rebuilt cleanly with the same `g++ -w -O3 --fast-math -o FASPR src/*.cpp`.
+Tested against example/1mol.pdb (chain A, residues 1-94, no insertion
+codes):
+- Default (no -n/-m at all): re-confirmed BYTE-IDENTICAL to a
+  from-scratch pristine build containing none of this feature (not just
+  the earlier global-only patch) -- the site-override machinery is a
+  true no-op when unused.
+- `-n 10 -n A:15:1 -n A:20:2` (inline overrides + default) and
+  `-n 10 -m sitemap.txt` (same overrides via file) produced
+  byte-identical output to each other, confirming the two input
+  mechanisms are equivalent.
+- An override for a nonexistent site (`-n B:999:2`) printed a warning
+  and packing proceeded normally (did not fail).
+- Malformed inline tokens (bad chain, e.g. `AB:15:2`; bad N, e.g.
+  `A:15:0`; bad position, e.g. `A:15.5:2`) were all rejected with a
+  clear stderr message and exit code 1.
+- A nonexistent `-m` file, and a malformed line inside an existing `-m`
+  file, were both rejected with a clear stderr message (including line
+  number for file-content errors) and exit code 1.
+- Duplicate overrides for the same site (`-n A:15:1 -n A:15:5`) printed
+  a warning and used the later value, as documented.
+- Combining inline overrides with `-m` in the same run was rejected
+  with exit code 1 and the documented mutual-exclusivity message.
+
+7. FOLLOW-UP: LIMITAROMACHI2 (-a CHI2MIN:CHI2MAX[:trp])
+=============================================================
+Added on request: a reproduction of Rosetta's `LimitAromaChi2` task
+operation. PHE, TYR and HIS (and TRP if opted in) rotamers are
+INCLUSIVELY filtered down to those whose chi2 angle falls in
+[chi2min,chi2max] (default 70-110), since the Dunbrack energy term's
+smoothing makes chi2-far-from-90 rotamers scorable even though they are
+rarely physically realistic. This is a separate, independent mechanism
+from the top-N restriction in sections 1-6, though it composes with it.
+
+7.1 ALGORITHM (as specified by the user, matching Rosetta's semantics)
+---------------------------------------------------------------------------
+For each candidate rotamer of a targeted residue:
+  1. Take its chi2 (the 2nd chi angle -- PHE/TYR/HIS/TRP all have exactly
+     2 chi angles in the Dunbrack library, so this is always index 1).
+  2. Fold it into [0,180) for the purposes of the test ONLY:
+       chi2_normalized = chi2 + 180  if chi2 < 0
+                        = chi2       otherwise
+     This folding is applied to a local copy used solely for the
+     accept/reject decision -- the rotamer's actual stored chi2 (and the
+     Cartesian geometry built from it) is never modified.
+  3. Keep the rotamer iff chi2min <= chi2_normalized <= chi2max.
+  4. Safety rule: if this would leave a residue with zero candidate
+     rotamers, abort the deletion for that residue and keep its full,
+     unfiltered candidate set instead (never produce a residue with no
+     rotamers to pack).
+Target residues: PHE, TYR, HIS always; TRP only if explicitly opted in
+(Rosetta's own rationale: TRP's energy landscape is more permissive for
+this problem in parts of the Ramachandran plot, so it's excluded unless
+the user asks for it).
+
+7.2 INSERTION POINT
+-----------------------------------
+Same per-residue loop in LoadBBdepRotlib2010() as the top-N feature
+(section 1), applied to the local stmp/ctmp right after the raw
+Dunbrack read loop -- but BEFORE the top-N truncation block. Order
+matters: the chi2 filter first narrows the candidate pool to the
+physically-acceptable set, then top-N (if requested) ranks and
+truncates within that already-filtered set, not the raw unfiltered one.
+
+7.3 FILES/FUNCTIONS CHANGED
+-----------------------------------
+- src/RotamerBuilder.cpp
+  - Added `extern bool AROMACHI2_ENABLED;`, `extern float AROMACHI2_MIN;`,
+    `extern float AROMACHI2_MAX;`, `extern bool AROMACHI2_INCLUDE_TRP;`
+  - In LoadBBdepRotlib2010(), right after the raw read loop and before
+    the existing top-N block, added:
+
+      if(AROMACHI2_ENABLED && (seq[i]=='F'||seq[i]=='Y'||seq[i]=='H'||
+         (AROMACHI2_INCLUDE_TRP&&seq[i]=='W'))){
+        FV1 stmpA; FV2 ctmpA; float chi2;
+        for(k=0;k<(int)ctmp.size();k++){
+          chi2=ctmp[k][1];
+          if(chi2<0.)chi2+=180.;
+          if(chi2>=AROMACHI2_MIN && chi2<=AROMACHI2_MAX){
+            stmpA.push_back(stmp[k]);
+            ctmpA.push_back(ctmp[k]);
+          }
+        }
+        if(!stmpA.empty()){
+          stmp=stmpA; ctmp=ctmpA;
+        }
+      }
+
+- src/FASPR.cpp
+  - Added globals `bool AROMACHI2_ENABLED=false;`,
+    `float AROMACHI2_MIN=70.0, AROMACHI2_MAX=110.0;`,
+    `bool AROMACHI2_INCLUDE_TRP=false;` (disabled by default, exactly
+    preserving existing behavior when `-a` is omitted).
+  - Added a `ParseReal()` helper (strtod-based, rejects empty/garbage
+    input) alongside the existing `-n`/`-m` parsing helpers.
+  - Added a new `-a CHI2MIN:CHI2MAX[:trp]` branch: splits on `:`,
+    requires exactly 2 or 3 fields, validates CHI2MIN/CHI2MAX as real
+    numbers with `0 <= CHI2MIN < CHI2MAX <= 180`, and validates an
+    optional 3rd field is exactly the literal `trp`. Any violation
+    prints a clear stderr message and exits with code 1.
+  - Updated usage/help text.
+
+- README.md
+  - Documented `-a CHI2MIN:CHI2MAX[:trp]`, its relationship to Rosetta's
+    LimitAromaChi2, the chi2-folding/safety-fallback semantics, and how
+    it composes with `-n`/`-m`. Added two example commands.
+
+7.4 BUILD / TEST RESULTS
+-------------------------
+Rebuilt cleanly with the same `g++ -w -O3 --fast-math -o FASPR src/*.cpp`.
+Tested against example/1mol.pdb (12 PHE/TYR residues, 1 TRP, 0 HIS):
+- Default (no -a at all): rebuilt a comparison binary with the
+  LimitAromaChi2 code path entirely removed from RotamerBuilder.cpp/.h
+  and confirmed BYTE-IDENTICAL output to the full feature build --
+  confirms `-a` omission is a true no-op.
+- `-a 70:110`: ran successfully; GEOMETRICALLY VERIFIED by recomputing
+  each PHE/TYR residue's actual chi2 dihedral (CA-CB-CG-CD1) from the
+  output PDB's Cartesian coordinates independently in Python -- all 12
+  PHE/TYR residues' folded chi2 landed inside [70,110] in the final
+  packed structure (TRP was correctly left unrestricted).
+- `-a 70:110:trp`: same check extended to the structure's one TRP
+  residue (CA-CB-CG-CD1) -- also landed inside [70,110], confirming the
+  include_trp opt-in works.
+- `-a 70:110` combined with `-n 5`: ran successfully (confirms
+  composability of the two independent mechanisms).
+- Safety-fallback stress test with a near-impossible 0.2-degree window
+  (`-a 89.9:90.1`): every one of the 12 PHE/TYR residues' Dunbrack
+  candidate pools had zero rotamers in that window, so the fallback
+  engaged for all of them (geometrically confirmed none of their final
+  chi2 values landed in the tiny window) -- the program completed
+  normally with exit code 0, i.e. the "never leave zero rotamers" rule
+  prevents a crash/stall as intended.
+- Invalid inputs rejected with a clear stderr message and exit code 1:
+  `-a 110:70` (min>=max), `-a -10:110` and `-a 70:200` (outside
+  0-180), `-a foo:bar` (non-numeric), `-a 70:110:xyz` (bad 3rd field).
+
+7.5 FOLLOW-UP FIX: SILENT NO-OP WHEN A -n/-m OVERRIDE TARGETS A FIXED OR
+    ALA/GLY RESIDUE
+---------------------------------------------------------------------------
+Identified via user question: the goto-CT fast path in
+LoadBBdepRotlib2010() (section 1) skips rotamer generation entirely for
+any residue with subStat[i]==0 (fixed via lower-case in -s, see
+LoadSeq(string&)) or seq[i]=='A'/'G' (no side chain to restrict). Both
+the LimitAromaChi2 block and the top-N block in sections 1-7 are inside
+that skipped region, so a `-n CHAIN:POS:N` or `-m` override that happens
+to target such a residue was being matched (no "unmatched" warning) but
+silently had zero effect -- a footgun for pipelines that combine
+partial-fixing (-s lower-case) with per-site top-N.
+
+Fix: in RotamerBuilder::BuildSiteTopNMap() (src/RotamerBuilder.cpp),
+right after an override is matched to residue i, added:
+
+  if(subStat[i]==0){
+    cout<<"warning! -n/-m site override for chain '"<<ov.chID<<"' residue "<<ov.pos<<ov.ins
+        <<" has no effect: this residue is fixed via -s and will not be repacked"<<endl;
+  }
+  else if(seq[i]=='A'||seq[i]=='G'){
+    cout<<"warning! -n/-m site override for chain '"<<ov.chID<<"' residue "<<ov.pos<<ov.ins
+        <<" has no effect: "<<(seq[i]=='A'?"ALA":"GLY")<<" has no side-chain rotamers to restrict"<<endl;
+  }
+
+The override is still recorded in siteTopNMap (harmless, since it's
+never consulted for a skipped residue); the warning just makes the
+no-op visible instead of silent. README.md documents this behavior.
+
+Tested against example/1mol.pdb: `-n A:15:2` with residue A15 lower-
+cased (fixed) in an -s file printed the fixed-residue warning; `-n A:9:2`
+(A9 is Gly) printed the ALA/GLY warning; a normal, non-fixed, non-Gly
+site and the no-`-n`/`-m` default both produced no warnings, confirming
+no regression.
+
+7.6 NOTE ON THE CHI2 FOLD (per explicit user clarification)
+---------------------------------------------------------------
+The `+180` fold is applied only to a local temporary used for the
+accept/reject comparison; it is never written back into the rotamer's
+actual chi2 value (`ctmp[k][1]`), so the geometry ultimately built for
+a kept rotamer is exactly the Dunbrack library's original, unmodified
+chi2 -- matching the behavior of Rosetta's own implementation as
+described by the user.

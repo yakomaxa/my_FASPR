@@ -33,6 +33,14 @@ struct Topology
   FV2 ic;
 };
 
+struct SiteOverride
+{
+  char chID;
+  int pos;
+  char ins;
+  int topn;
+};
+
 class RotamerBuilder:public Structure
 {
 public:
@@ -41,6 +49,7 @@ public:
   void LoadSeq(string &seqfile);
   void LoadParameter();
   void LoadBBdepRotlib2010();
+  void BuildSiteTopNMap();
   void BuildSidechain();
   void RotlibFromBinary2Text(string binlibfile,string &txtlibfile);
   void RotlibFromText2Binary(string &fulltextlib,string &binlibfile);
@@ -59,6 +68,7 @@ public:
   FV4 sc;
   map<char,float> wRotlib;
   map<char,Topology> sidechainTopo;
+  map<string,int> siteTopNMap;
 };
 
 #endif
